@@ -538,93 +538,19 @@ static void setSelection(intptr_t startPos, intptr_t endPos) {
 }
 
 // ---------------------------------------------------------------------------
-// XNCloseButton — title-bar close (✕) button matching the Document Map
-// Panel's _DMPCloseButton (host DocumentMapPanel.mm:55-117) pixel-for-pixel:
-// 16×16 square, permanent 1px grey border, light-blue hover fill in light
-// mode, fill skipped in dark mode, toolbar-blue border on hover/press in
-// either mode.
-// ---------------------------------------------------------------------------
-@interface XNCloseButton : NSButton { BOOL _hovering; }
-@end
-
-@implementation XNCloseButton
-
-- (instancetype)initWithFrame:(NSRect)frame {
-    self = [super initWithFrame:frame];
-    if (self) {
-        self.bordered = NO;
-        self.buttonType = NSButtonTypeMomentaryChange;
-        self.title = @"";
-        NSTrackingArea *ta = [[NSTrackingArea alloc]
-            initWithRect:NSZeroRect
-                 options:(NSTrackingMouseEnteredAndExited |
-                          NSTrackingActiveInActiveApp     |
-                          NSTrackingInVisibleRect)
-                   owner:self userInfo:nil];
-        [self addTrackingArea:ta];
-    }
-    return self;
-}
-
-- (void)mouseEntered:(NSEvent *)event { _hovering = YES; [self setNeedsDisplay:YES]; }
-- (void)mouseExited:(NSEvent *)event  { _hovering = NO;  [self setNeedsDisplay:YES]; }
-
-- (void)drawRect:(NSRect)dirtyRect {
-    BOOL pressed = self.isHighlighted;
-    BOOL active  = pressed || _hovering;
-    BOOL isDark  = NO;
-    if (@available(macOS 10.14, *)) {
-        NSAppearanceName match = [self.effectiveAppearance
-            bestMatchFromAppearancesWithNames:@[ NSAppearanceNameAqua, NSAppearanceNameDarkAqua ]];
-        isDark = [match isEqualToString:NSAppearanceNameDarkAqua];
-    }
-
-    // Background fill — only when hovered/pressed AND in light mode. In
-    // dark mode the light-blue fill would clash with the dark title bar,
-    // so we skip it and let only the border change color on hover.
-    if (active && !isDark) {
-        NSColor *bg = pressed
-            ? [NSColor colorWithRed:0xCC/255.0 green:0xE8/255.0 blue:0xFF/255.0 alpha:1.0]
-            : [NSColor colorWithRed:0xE5/255.0 green:0xF3/255.0 blue:0xFF/255.0 alpha:1.0];
-        [bg setFill];
-        NSRectFill(self.bounds);
-    }
-
-    // Border — always drawn. Grey at rest; toolbar-blue when hovered/pressed.
-    NSColor *bdr = active
-        ? [NSColor colorWithRed:0xD0/255.0 green:0xEA/255.0 blue:0xFF/255.0 alpha:1.0]
-        : [NSColor colorWithWhite:0.75 alpha:1.0];
-    NSBezierPath *border = [NSBezierPath bezierPathWithRect:NSInsetRect(self.bounds, 0.5, 0.5)];
-    border.lineWidth = 1.0;
-    [bdr setStroke];
-    [border stroke];
-
-    // Glyph (✕) centered via NSAttributedString for true vertical centering.
-    NSString *glyph = @"✕";
-    NSDictionary *attrs = @{
-        NSFontAttributeName: self.font ?: [NSFont systemFontOfSize:11],
-        NSForegroundColorAttributeName: [NSColor labelColor],
-    };
-    NSSize sz = [glyph sizeWithAttributes:attrs];
-    NSPoint origin = NSMakePoint(NSMidX(self.bounds) - sz.width / 2.0,
-                                 NSMidY(self.bounds) - sz.height / 2.0);
-    [glyph drawAtPoint:origin withAttributes:attrs];
-}
-
-@end
-
-// ---------------------------------------------------------------------------
 // NavigatorPanel — content view (NSView). In v1.0.3+ the view is docked in
 // the host's SidePanelHost via NPPM_DMM_REGISTERPANEL; on older hosts the
 // plugin wraps it in a floating NSPanel instead. Both paths share this
 // single class — it's just a content view either way.
+//
+// The panel no longer renders its own title bar or close X. In the docked
+// path the host's PanelFrame provides both chrome elements; in the floating
+// path the NSPanel's native title bar (NSWindowStyleMaskTitled +
+// NSWindowStyleMaskClosable) does the same job. What remains here is the
+// panel body: the filter row and the tree view.
 // ---------------------------------------------------------------------------
 @interface NavigatorPanel : NSView <NSOutlineViewDataSource, NSOutlineViewDelegate,
                                      NSTextFieldDelegate, NSMenuItemValidation>
-@property(nonatomic, strong) NSView      *titleBar;    // internal title bar (title + close)
-@property(nonatomic, strong) NSBox       *titleSeparator;  // 1px line under title bar
-@property(nonatomic, strong) NSTextField *titleLabel;
-@property(nonatomic, strong) XNCloseButton *hideButton;  // close X — DocMap-styled
 @property(nonatomic, strong) NSTextField *filterField;
 @property(nonatomic, strong) NSButton    *clearButton;
 @property(nonatomic, strong) XNOutlineView *outlineView;
@@ -676,38 +602,9 @@ static const CGFloat kRowPadding      = 3.0;  // rowHeight = ceil(font size) + p
 - (void)buildUI {
     NSView *root = self;
 
-    // ── Internal title bar ────────────────────────────────────────────
-    // Matches the built-in side panels (Function List, Document Map, etc.):
-    // 24pt tall, tabBarBackground #F0F0F0 in light mode / dark variant in
-    // dark mode, a 1pt NSBoxSeparator below, and a close X on the right.
-    _titleBar = [[NSView alloc] initWithFrame:NSZeroRect];
-    _titleBar.translatesAutoresizingMaskIntoConstraints = NO;
-    _titleBar.wantsLayer = YES;
-    [root addSubview:_titleBar];
-
-    _titleLabel = [NSTextField labelWithString:@"XML Navigator"];
-    _titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    _titleLabel.font = [NSFont systemFontOfSize:11];
-    _titleLabel.textColor = [NSColor labelColor];
-    _titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
-    [_titleBar addSubview:_titleLabel];
-
-    _hideButton = [[XNCloseButton alloc] initWithFrame:NSZeroRect];
-    _hideButton.translatesAutoresizingMaskIntoConstraints = NO;
-    _hideButton.target = self;
-    _hideButton.action = @selector(hideFromTitleBar:);
-    _hideButton.font = [NSFont systemFontOfSize:11];
-    _hideButton.toolTip = @"Hide";
-    [_titleBar addSubview:_hideButton];
-
-    // 1pt separator line between title bar and filter row — matches
-    // FunctionList / DocMap / Project Panel etc.
-    _titleSeparator = [[NSBox alloc] init];
-    _titleSeparator.boxType = NSBoxSeparator;
-    _titleSeparator.translatesAutoresizingMaskIntoConstraints = NO;
-    [root addSubview:_titleSeparator];
-
-    // Filter row
+    // Filter row — sits at the top of the panel body. Chrome (title bar,
+    // close X, separator) is provided by the host's PanelFrame in the
+    // docked path and by the NSPanel's native chrome in the floating path.
     _filterField = [[NSTextField alloc] initWithFrame:NSZeroRect];
     _filterField.translatesAutoresizingMaskIntoConstraints = NO;
     _filterField.placeholderString = @"Filter nodes…";
@@ -772,31 +669,10 @@ static const CGFloat kRowPadding      = 3.0;  // rowHeight = ceil(font size) + p
     for (NSMenuItem *item in menu.itemArray) item.target = self;
     _outlineView.menu = menu;
 
-    // Layout: title bar (24pt) → separator (1pt) → filter row → outline view
+    // Layout: filter row at top → outline view fills the rest.
     [NSLayoutConstraint activateConstraints:@[
-        // Title bar spans full width at top, 24pt tall (matches DocMap / FunctionList)
-        [_titleBar.topAnchor       constraintEqualToAnchor:root.topAnchor],
-        [_titleBar.leadingAnchor   constraintEqualToAnchor:root.leadingAnchor],
-        [_titleBar.trailingAnchor  constraintEqualToAnchor:root.trailingAnchor],
-        [_titleBar.heightAnchor    constraintEqualToConstant:24],
-
-        [_titleLabel.leadingAnchor constraintEqualToAnchor:_titleBar.leadingAnchor constant:6],
-        [_titleLabel.centerYAnchor constraintEqualToAnchor:_titleBar.centerYAnchor],
-        [_titleLabel.trailingAnchor constraintLessThanOrEqualToAnchor:_hideButton.leadingAnchor constant:-4],
-
-        [_hideButton.trailingAnchor constraintEqualToAnchor:_titleBar.trailingAnchor constant:-4],
-        [_hideButton.centerYAnchor  constraintEqualToAnchor:_titleBar.centerYAnchor],
-        [_hideButton.widthAnchor    constraintEqualToConstant:16],
-        [_hideButton.heightAnchor   constraintEqualToConstant:16],
-
-        // 1pt separator line between title bar and search field
-        [_titleSeparator.topAnchor      constraintEqualToAnchor:_titleBar.bottomAnchor],
-        [_titleSeparator.leadingAnchor  constraintEqualToAnchor:root.leadingAnchor],
-        [_titleSeparator.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
-        [_titleSeparator.heightAnchor   constraintEqualToConstant:1],
-
-        // Filter row sits directly under the separator
-        [_filterField.topAnchor     constraintEqualToAnchor:_titleSeparator.bottomAnchor constant:4],
+        // Filter row sits at the top of the panel body
+        [_filterField.topAnchor     constraintEqualToAnchor:root.topAnchor constant:4],
         [_filterField.leadingAnchor constraintEqualToAnchor:root.leadingAnchor constant:6],
         [_filterField.trailingAnchor constraintEqualToAnchor:_clearButton.leadingAnchor constant:-4],
         [_filterField.heightAnchor  constraintEqualToConstant:22],
@@ -812,37 +688,6 @@ static const CGFloat kRowPadding      = 3.0;  // rowHeight = ceil(font size) + p
         [_scrollView.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
         [_scrollView.bottomAnchor   constraintEqualToAnchor:root.bottomAnchor],
     ]];
-
-    [self updateTitleBarBackground];
-}
-
-// Match FunctionList / DocMap title-bar color (#F0F0F0 light, dark variant).
-// `NppThemeManager.tabBarBackground` is host-private, so we pick values by
-// effective appearance — redrawn automatically on dark-mode toggle via
-// -viewDidChangeEffectiveAppearance.
-- (void)updateTitleBarBackground {
-    BOOL isDark = NO;
-    if (@available(macOS 10.14, *)) {
-        NSAppearanceName match = [self.effectiveAppearance
-            bestMatchFromAppearancesWithNames:@[ NSAppearanceNameAqua, NSAppearanceNameDarkAqua ]];
-        isDark = [match isEqualToString:NSAppearanceNameDarkAqua];
-    }
-    NSColor *bg = isDark
-        ? [NSColor colorWithWhite:0.18 alpha:1.0]       // dark side-panel title background
-        : [NSColor colorWithRed:0xF0/255.0 green:0xF0/255.0 blue:0xF0/255.0 alpha:1.0];
-    _titleBar.layer.backgroundColor = bg.CGColor;
-}
-
-- (void)viewDidChangeEffectiveAppearance {
-    [super viewDidChangeEffectiveAppearance];
-    [self updateTitleBarBackground];
-}
-
-// Called by the close-X in our internal title bar. The plugin-level
-// layer (below) routes this to NPPM_DMM_HIDEPANEL (docked) or to the
-// floating NSPanel's orderOut: (fallback).
-- (void)hideFromTitleBar:(id)sender {
-    xmlNavigatorHidePanel();
 }
 
 // Re-read the active Scintilla buffer and rebuild the tree.
