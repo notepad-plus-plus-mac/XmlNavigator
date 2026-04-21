@@ -40,6 +40,9 @@ enum FuncIdx {
 // Forward decls
 @class NavigatorPanel;
 static NavigatorPanel *g_panel = nil;
+static void xmlNavigatorShowPanel(void);
+static void xmlNavigatorHidePanel(void);
+static BOOL xmlNavigatorPanelIsShown(void);
 
 // ---------------------------------------------------------------------------
 // Scintilla / NPP helpers
@@ -509,10 +512,21 @@ static ParseResult parse(const std::string &src) {
 // ---------------------------------------------------------------------------
 // Scintilla navigation helpers
 // ---------------------------------------------------------------------------
+// Scintilla's SCI_GRABFOCUS (2400) hands keyboard focus back to the editor
+// widget. Critical when navigating from a docked panel — without it the
+// caret moves at the byte level but Scintilla stays unfocused, so the
+// caret is drawn dimmed (or invisibly) and the user sees nothing change.
+// The floating-panel era didn't have this problem because the plugin
+// window was separate and the main editor already owned key focus.
+#ifndef SCI_GRABFOCUS
+#  define SCI_GRABFOCUS 2400
+#endif
+
 static void gotoPosition(intptr_t position) {
     if (position < 0) return;
     sci(SCI_GOTOPOS, (uintptr_t)position);
     sci(SCI_SCROLLCARET);
+    sci(SCI_GRABFOCUS);
 }
 
 static void setSelection(intptr_t startPos, intptr_t endPos) {
@@ -520,13 +534,97 @@ static void setSelection(intptr_t startPos, intptr_t endPos) {
     sci(SCI_SETSELECTIONSTART, (uintptr_t)startPos);
     sci(SCI_SETSELECTIONEND,   (uintptr_t)endPos);
     sci(SCI_SCROLLCARET);
+    sci(SCI_GRABFOCUS);
 }
 
 // ---------------------------------------------------------------------------
-// NavigatorPanel — floating NSPanel with filter field + outline view
+// XNCloseButton — title-bar close (✕) button matching the Document Map
+// Panel's _DMPCloseButton (host DocumentMapPanel.mm:55-117) pixel-for-pixel:
+// 16×16 square, permanent 1px grey border, light-blue hover fill in light
+// mode, fill skipped in dark mode, toolbar-blue border on hover/press in
+// either mode.
 // ---------------------------------------------------------------------------
-@interface NavigatorPanel : NSPanel <NSOutlineViewDataSource, NSOutlineViewDelegate,
+@interface XNCloseButton : NSButton { BOOL _hovering; }
+@end
+
+@implementation XNCloseButton
+
+- (instancetype)initWithFrame:(NSRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.bordered = NO;
+        self.buttonType = NSButtonTypeMomentaryChange;
+        self.title = @"";
+        NSTrackingArea *ta = [[NSTrackingArea alloc]
+            initWithRect:NSZeroRect
+                 options:(NSTrackingMouseEnteredAndExited |
+                          NSTrackingActiveInActiveApp     |
+                          NSTrackingInVisibleRect)
+                   owner:self userInfo:nil];
+        [self addTrackingArea:ta];
+    }
+    return self;
+}
+
+- (void)mouseEntered:(NSEvent *)event { _hovering = YES; [self setNeedsDisplay:YES]; }
+- (void)mouseExited:(NSEvent *)event  { _hovering = NO;  [self setNeedsDisplay:YES]; }
+
+- (void)drawRect:(NSRect)dirtyRect {
+    BOOL pressed = self.isHighlighted;
+    BOOL active  = pressed || _hovering;
+    BOOL isDark  = NO;
+    if (@available(macOS 10.14, *)) {
+        NSAppearanceName match = [self.effectiveAppearance
+            bestMatchFromAppearancesWithNames:@[ NSAppearanceNameAqua, NSAppearanceNameDarkAqua ]];
+        isDark = [match isEqualToString:NSAppearanceNameDarkAqua];
+    }
+
+    // Background fill — only when hovered/pressed AND in light mode. In
+    // dark mode the light-blue fill would clash with the dark title bar,
+    // so we skip it and let only the border change color on hover.
+    if (active && !isDark) {
+        NSColor *bg = pressed
+            ? [NSColor colorWithRed:0xCC/255.0 green:0xE8/255.0 blue:0xFF/255.0 alpha:1.0]
+            : [NSColor colorWithRed:0xE5/255.0 green:0xF3/255.0 blue:0xFF/255.0 alpha:1.0];
+        [bg setFill];
+        NSRectFill(self.bounds);
+    }
+
+    // Border — always drawn. Grey at rest; toolbar-blue when hovered/pressed.
+    NSColor *bdr = active
+        ? [NSColor colorWithRed:0xD0/255.0 green:0xEA/255.0 blue:0xFF/255.0 alpha:1.0]
+        : [NSColor colorWithWhite:0.75 alpha:1.0];
+    NSBezierPath *border = [NSBezierPath bezierPathWithRect:NSInsetRect(self.bounds, 0.5, 0.5)];
+    border.lineWidth = 1.0;
+    [bdr setStroke];
+    [border stroke];
+
+    // Glyph (✕) centered via NSAttributedString for true vertical centering.
+    NSString *glyph = @"✕";
+    NSDictionary *attrs = @{
+        NSFontAttributeName: self.font ?: [NSFont systemFontOfSize:11],
+        NSForegroundColorAttributeName: [NSColor labelColor],
+    };
+    NSSize sz = [glyph sizeWithAttributes:attrs];
+    NSPoint origin = NSMakePoint(NSMidX(self.bounds) - sz.width / 2.0,
+                                 NSMidY(self.bounds) - sz.height / 2.0);
+    [glyph drawAtPoint:origin withAttributes:attrs];
+}
+
+@end
+
+// ---------------------------------------------------------------------------
+// NavigatorPanel — content view (NSView). In v1.0.3+ the view is docked in
+// the host's SidePanelHost via NPPM_DMM_REGISTERPANEL; on older hosts the
+// plugin wraps it in a floating NSPanel instead. Both paths share this
+// single class — it's just a content view either way.
+// ---------------------------------------------------------------------------
+@interface NavigatorPanel : NSView <NSOutlineViewDataSource, NSOutlineViewDelegate,
                                      NSTextFieldDelegate, NSMenuItemValidation>
+@property(nonatomic, strong) NSView      *titleBar;    // internal title bar (title + close)
+@property(nonatomic, strong) NSBox       *titleSeparator;  // 1px line under title bar
+@property(nonatomic, strong) NSTextField *titleLabel;
+@property(nonatomic, strong) XNCloseButton *hideButton;  // close X — DocMap-styled
 @property(nonatomic, strong) NSTextField *filterField;
 @property(nonatomic, strong) NSButton    *clearButton;
 @property(nonatomic, strong) XNOutlineView *outlineView;
@@ -542,6 +640,9 @@ static void setSelection(intptr_t startPos, intptr_t endPos) {
 - (void)toggleDisclosureFromButton:(XNDiscView *)sender;
 - (void)bumpFontSize:(CGFloat)delta;
 - (void)resetFontSize;
+// YES when the panel is attached to a window (docked host or floating
+// fallback). Replaces the NSPanel isVisible check we used to rely on.
+- (BOOL)isShown;
 @end
 
 // Row-height + font-size tuning constants. Kept small so the tree packs
@@ -557,27 +658,54 @@ static const CGFloat kRowPadding      = 3.0;  // rowHeight = ceil(font size) + p
     static NavigatorPanel *panel = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        NSRect frame = NSMakeRect(0, 0, 420, 520);
-        NSUInteger mask = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
-                          NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable |
-                          NSWindowStyleMaskUtilityWindow;
-        panel = [[NavigatorPanel alloc] initWithContentRect:frame
-                                                  styleMask:mask
-                                                    backing:NSBackingStoreBuffered
-                                                      defer:YES];
-        panel.title = @"XML Navigator";
-        panel.floatingPanel = YES;
-        panel.becomesKeyOnlyIfNeeded = YES;
-        panel.hidesOnDeactivate = NO;
-        panel.releasedWhenClosed = NO;
+        // Default frame — overridden by autolayout once added to a parent
+        // (SidePanelHost stack sizes us automatically; floating NSPanel
+        // wrapper gives us the window's content rect).
+        panel = [[NavigatorPanel alloc] initWithFrame:NSMakeRect(0, 0, 280, 520)];
+        panel.translatesAutoresizingMaskIntoConstraints = NO;
         [panel buildUI];
-        [panel center];
     });
     return panel;
 }
 
+- (BOOL)isShown {
+    // Attached to a window AND has a superview = rendered somewhere.
+    return self.window != nil && self.superview != nil;
+}
+
 - (void)buildUI {
-    NSView *root = self.contentView;
+    NSView *root = self;
+
+    // ── Internal title bar ────────────────────────────────────────────
+    // Matches the built-in side panels (Function List, Document Map, etc.):
+    // 24pt tall, tabBarBackground #F0F0F0 in light mode / dark variant in
+    // dark mode, a 1pt NSBoxSeparator below, and a close X on the right.
+    _titleBar = [[NSView alloc] initWithFrame:NSZeroRect];
+    _titleBar.translatesAutoresizingMaskIntoConstraints = NO;
+    _titleBar.wantsLayer = YES;
+    [root addSubview:_titleBar];
+
+    _titleLabel = [NSTextField labelWithString:@"XML Navigator"];
+    _titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    _titleLabel.font = [NSFont systemFontOfSize:11];
+    _titleLabel.textColor = [NSColor labelColor];
+    _titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    [_titleBar addSubview:_titleLabel];
+
+    _hideButton = [[XNCloseButton alloc] initWithFrame:NSZeroRect];
+    _hideButton.translatesAutoresizingMaskIntoConstraints = NO;
+    _hideButton.target = self;
+    _hideButton.action = @selector(hideFromTitleBar:);
+    _hideButton.font = [NSFont systemFontOfSize:11];
+    _hideButton.toolTip = @"Hide";
+    [_titleBar addSubview:_hideButton];
+
+    // 1pt separator line between title bar and filter row — matches
+    // FunctionList / DocMap / Project Panel etc.
+    _titleSeparator = [[NSBox alloc] init];
+    _titleSeparator.boxType = NSBoxSeparator;
+    _titleSeparator.translatesAutoresizingMaskIntoConstraints = NO;
+    [root addSubview:_titleSeparator];
 
     // Filter row
     _filterField = [[NSTextField alloc] initWithFrame:NSZeroRect];
@@ -625,7 +753,9 @@ static const CGFloat kRowPadding      = 3.0;  // rowHeight = ceil(font size) + p
     _scrollView.hasVerticalScroller = YES;
     _scrollView.hasHorizontalScroller = YES;
     _scrollView.autohidesScrollers = YES;
-    _scrollView.borderType = NSLineBorder;
+    // No outer border — matches FunctionList / DocMap. The SidePanelHost
+    // stack + window chrome provide all the visual separation we need.
+    _scrollView.borderType = NSNoBorder;
     _scrollView.documentView = _outlineView;
     [root addSubview:_scrollView];
 
@@ -642,24 +772,77 @@ static const CGFloat kRowPadding      = 3.0;  // rowHeight = ceil(font size) + p
     for (NSMenuItem *item in menu.itemArray) item.target = self;
     _outlineView.menu = menu;
 
-    // Layout
-    NSDictionary *v = NSDictionaryOfVariableBindings(_filterField, _clearButton, _scrollView);
+    // Layout: title bar (24pt) → separator (1pt) → filter row → outline view
     [NSLayoutConstraint activateConstraints:@[
-        [_filterField.topAnchor    constraintEqualToAnchor:root.topAnchor constant:10],
-        [_filterField.leadingAnchor constraintEqualToAnchor:root.leadingAnchor constant:10],
-        [_filterField.trailingAnchor constraintEqualToAnchor:_clearButton.leadingAnchor constant:-6],
-        [_filterField.heightAnchor constraintEqualToConstant:22],
+        // Title bar spans full width at top, 24pt tall (matches DocMap / FunctionList)
+        [_titleBar.topAnchor       constraintEqualToAnchor:root.topAnchor],
+        [_titleBar.leadingAnchor   constraintEqualToAnchor:root.leadingAnchor],
+        [_titleBar.trailingAnchor  constraintEqualToAnchor:root.trailingAnchor],
+        [_titleBar.heightAnchor    constraintEqualToConstant:24],
 
-        [_clearButton.topAnchor    constraintEqualToAnchor:_filterField.topAnchor],
-        [_clearButton.trailingAnchor constraintEqualToAnchor:root.trailingAnchor constant:-10],
-        [_clearButton.widthAnchor  constraintEqualToConstant:26],
-        [_clearButton.heightAnchor constraintEqualToConstant:22],
+        [_titleLabel.leadingAnchor constraintEqualToAnchor:_titleBar.leadingAnchor constant:6],
+        [_titleLabel.centerYAnchor constraintEqualToAnchor:_titleBar.centerYAnchor],
+        [_titleLabel.trailingAnchor constraintLessThanOrEqualToAnchor:_hideButton.leadingAnchor constant:-4],
 
-        [_scrollView.topAnchor     constraintEqualToAnchor:_filterField.bottomAnchor constant:8],
-        [_scrollView.leadingAnchor constraintEqualToAnchor:root.leadingAnchor constant:10],
-        [_scrollView.trailingAnchor constraintEqualToAnchor:root.trailingAnchor constant:-10],
-        [_scrollView.bottomAnchor  constraintEqualToAnchor:root.bottomAnchor constant:-10],
+        [_hideButton.trailingAnchor constraintEqualToAnchor:_titleBar.trailingAnchor constant:-4],
+        [_hideButton.centerYAnchor  constraintEqualToAnchor:_titleBar.centerYAnchor],
+        [_hideButton.widthAnchor    constraintEqualToConstant:16],
+        [_hideButton.heightAnchor   constraintEqualToConstant:16],
+
+        // 1pt separator line between title bar and search field
+        [_titleSeparator.topAnchor      constraintEqualToAnchor:_titleBar.bottomAnchor],
+        [_titleSeparator.leadingAnchor  constraintEqualToAnchor:root.leadingAnchor],
+        [_titleSeparator.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
+        [_titleSeparator.heightAnchor   constraintEqualToConstant:1],
+
+        // Filter row sits directly under the separator
+        [_filterField.topAnchor     constraintEqualToAnchor:_titleSeparator.bottomAnchor constant:4],
+        [_filterField.leadingAnchor constraintEqualToAnchor:root.leadingAnchor constant:6],
+        [_filterField.trailingAnchor constraintEqualToAnchor:_clearButton.leadingAnchor constant:-4],
+        [_filterField.heightAnchor  constraintEqualToConstant:22],
+
+        [_clearButton.topAnchor     constraintEqualToAnchor:_filterField.topAnchor],
+        [_clearButton.trailingAnchor constraintEqualToAnchor:root.trailingAnchor constant:-6],
+        [_clearButton.widthAnchor   constraintEqualToConstant:26],
+        [_clearButton.heightAnchor  constraintEqualToConstant:22],
+
+        // Outline fills the remaining space (flush to edges — no border)
+        [_scrollView.topAnchor      constraintEqualToAnchor:_filterField.bottomAnchor constant:4],
+        [_scrollView.leadingAnchor  constraintEqualToAnchor:root.leadingAnchor],
+        [_scrollView.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
+        [_scrollView.bottomAnchor   constraintEqualToAnchor:root.bottomAnchor],
     ]];
+
+    [self updateTitleBarBackground];
+}
+
+// Match FunctionList / DocMap title-bar color (#F0F0F0 light, dark variant).
+// `NppThemeManager.tabBarBackground` is host-private, so we pick values by
+// effective appearance — redrawn automatically on dark-mode toggle via
+// -viewDidChangeEffectiveAppearance.
+- (void)updateTitleBarBackground {
+    BOOL isDark = NO;
+    if (@available(macOS 10.14, *)) {
+        NSAppearanceName match = [self.effectiveAppearance
+            bestMatchFromAppearancesWithNames:@[ NSAppearanceNameAqua, NSAppearanceNameDarkAqua ]];
+        isDark = [match isEqualToString:NSAppearanceNameDarkAqua];
+    }
+    NSColor *bg = isDark
+        ? [NSColor colorWithWhite:0.18 alpha:1.0]       // dark side-panel title background
+        : [NSColor colorWithRed:0xF0/255.0 green:0xF0/255.0 blue:0xF0/255.0 alpha:1.0];
+    _titleBar.layer.backgroundColor = bg.CGColor;
+}
+
+- (void)viewDidChangeEffectiveAppearance {
+    [super viewDidChangeEffectiveAppearance];
+    [self updateTitleBarBackground];
+}
+
+// Called by the close-X in our internal title bar. The plugin-level
+// layer (below) routes this to NPPM_DMM_HIDEPANEL (docked) or to the
+// floating NSPanel's orderOut: (fallback).
+- (void)hideFromTitleBar:(id)sender {
+    xmlNavigatorHidePanel();
 }
 
 // Re-read the active Scintilla buffer and rebuild the tree.
@@ -678,7 +861,7 @@ static const CGFloat kRowPadding      = 3.0;  // rowHeight = ceil(font size) + p
 // tree is gone. Then swap in the new tree and reloadData again. The
 // outline view picks up the new items with no stale refs left over.
 - (void)reload {
-    if (!self.isVisible) return;
+    if (![self isShown]) return;
 
     // Parse first — this doesn't touch self state yet.
     std::string text = currentDocumentText();
@@ -871,8 +1054,20 @@ static const CGFloat kRowPadding      = 3.0;  // rowHeight = ceil(font size) + p
 // filter field or the outline view — mirroring how the main app treats
 // zoom shortcuts.
 - (BOOL)performKeyEquivalent:(NSEvent *)event {
-    if ((event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask) ==
-        NSEventModifierFlagCommand) {
+    // Only claim Cmd+=/Cmd+-/Cmd+0 when focus is actually inside this
+    // panel. Otherwise — when the user is typing in the editor — we'd
+    // hijack the main editor's own zoom shortcut because NSWindow walks
+    // the entire view hierarchy looking for a key-equivalent handler.
+    NSResponder *fr = self.window.firstResponder;
+    BOOL focusedInPanel = NO;
+    if ([fr isKindOfClass:[NSView class]]) {
+        for (NSView *v = (NSView *)fr; v; v = v.superview) {
+            if (v == self) { focusedInPanel = YES; break; }
+        }
+    }
+    if (focusedInPanel &&
+        (event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask) ==
+            NSEventModifierFlagCommand) {
         NSString *c = event.charactersIgnoringModifiers ?: @"";
         if ([c isEqualToString:@"="] || [c isEqualToString:@"+"]) {
             [self bumpFontSize:+1]; return YES;
@@ -953,14 +1148,117 @@ static const CGFloat kRowPadding      = 3.0;  // rowHeight = ceil(font size) + p
 @end
 
 // ---------------------------------------------------------------------------
-// Menu callbacks
+// Docking layer — chooses between host-docked (NPPM_DMM_*) and floating
+// NSPanel fallback based on host support.
+//
+// Docked path (v1.0.3+): call NPPM_DMM_REGISTERPANEL once; if it returns
+// a nonzero handle the host has the docking API and we route all
+// show/hide through handle-based messages. NppPluginManager owns the
+// strong retain on the NSView.
+//
+// Floating path (older hosts): create an NSPanel once and use its
+// contentView slot to hold the NavigatorPanel. Same UX as before ARC.
+//
+// Both paths use the same NavigatorPanel instance — the view is simply
+// reparented between the side-panel stack and the floating NSPanel's
+// content slot.
 // ---------------------------------------------------------------------------
-static void cmdShowNavigator() {
+
+static uint64_t  g_panelHandle   = 0;     // nonzero → docked path active
+static NSPanel  *g_floatingPanel = nil;   // only used when docking unavailable
+
+// Build (lazily) the floating NSPanel used as a fallback when the host
+// doesn't support NPPM_DMM_*. The NavigatorPanel view is installed as the
+// panel's content view.
+static NSPanel *ensureFloatingPanel(void) {
+    if (g_floatingPanel) return g_floatingPanel;
+
+    NSRect frame = NSMakeRect(0, 0, 420, 520);
+    NSUInteger mask = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                      NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable |
+                      NSWindowStyleMaskUtilityWindow;
+    g_floatingPanel = [[NSPanel alloc] initWithContentRect:frame
+                                                 styleMask:mask
+                                                   backing:NSBackingStoreBuffered
+                                                     defer:YES];
+    g_floatingPanel.title = @"XML Navigator";
+    g_floatingPanel.floatingPanel = YES;
+    g_floatingPanel.becomesKeyOnlyIfNeeded = YES;
+    g_floatingPanel.hidesOnDeactivate = NO;
+    g_floatingPanel.releasedWhenClosed = NO;
+
+    NavigatorPanel *view = [NavigatorPanel sharedPanel];
+    // Mirror autoresizing so the view fills the panel as it resizes.
+    view.translatesAutoresizingMaskIntoConstraints = YES;
+    view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    view.frame = ((NSView *)g_floatingPanel.contentView).bounds;
+    [g_floatingPanel.contentView addSubview:view];
+    [g_floatingPanel center];
+    return g_floatingPanel;
+}
+
+static void xmlNavigatorShowPanel(void) {
     @autoreleasepool {
         g_panel = [NavigatorPanel sharedPanel];
-        [g_panel makeKeyAndOrderFront:nil];
+
+        // First-time registration against the docking API. nppData is set
+        // by setInfo which runs before NPPN_READY, so by the time the user
+        // clicks our menu item the send-message function pointer is live.
+        if (g_panelHandle == 0 && g_floatingPanel == nil) {
+            intptr_t h = nppData._sendMessage(nppData._nppHandle,
+                                              NPPM_DMM_REGISTERPANEL,
+                                              (uintptr_t)(__bridge void *)g_panel,
+                                              (intptr_t)"XML Navigator");
+            if (h > 0) {
+                g_panelHandle = (uint64_t)h;
+            } else {
+                // Older host — fall back to floating NSPanel. The NavigatorPanel
+                // view becomes the panel's contentView once and stays there.
+                ensureFloatingPanel();
+            }
+        }
+
+        if (g_panelHandle > 0) {
+            nppData._sendMessage(nppData._nppHandle,
+                                 NPPM_DMM_SHOWPANEL,
+                                 (uintptr_t)g_panelHandle, 0);
+        } else if (g_floatingPanel) {
+            [g_floatingPanel makeKeyAndOrderFront:nil];
+        }
+
         [g_panel reload];
     }
+}
+
+static void xmlNavigatorHidePanel(void) {
+    @autoreleasepool {
+        if (g_panelHandle > 0) {
+            nppData._sendMessage(nppData._nppHandle,
+                                 NPPM_DMM_HIDEPANEL,
+                                 (uintptr_t)g_panelHandle, 0);
+        } else if (g_floatingPanel) {
+            [g_floatingPanel orderOut:nil];
+        }
+    }
+}
+
+static BOOL xmlNavigatorPanelIsShown(void) {
+    if (g_panelHandle > 0) return g_panel && [g_panel isShown];
+    if (g_floatingPanel) return g_floatingPanel.visible;
+    return NO;
+}
+
+// ---------------------------------------------------------------------------
+// Menu callbacks
+// ---------------------------------------------------------------------------
+// Toggle semantics: if the panel is shown, hide it; otherwise show it.
+// This matches user expectation from native side panel toggles elsewhere
+// in Notepad++ (Function List, Document List, etc.).
+static void cmdShowNavigator() {
+    if (xmlNavigatorPanelIsShown())
+        xmlNavigatorHidePanel();
+    else
+        xmlNavigatorShowPanel();
 }
 
 static void cmdAbout() {
@@ -1004,20 +1302,31 @@ extern "C" NPP_EXPORT void beNotified(SCNotification *n) {
         case NPPN_BUFFERACTIVATED:
         case NPPN_FILESAVED:
             // Auto-refresh when the active buffer changes or is saved.
-            if (g_panel && g_panel.isVisible) [g_panel reload];
+            if (xmlNavigatorPanelIsShown()) [g_panel reload];
             break;
         case SCN_MODIFIED: {
             // Re-parse after edits that change text, but only when the panel
             // is visible. We could debounce here for very large docs; in
             // practice the tokenizer is fast enough for files up to a few
             // megabytes.
-            if (!g_panel || !g_panel.isVisible) break;
+            if (!xmlNavigatorPanelIsShown()) break;
             int mod = n->modificationType;
             if (mod & (SC_MOD_INSERTTEXT | SC_MOD_DELETETEXT)) {
                 [g_panel reload];
             }
             break;
         }
+        case NPPN_SHUTDOWN:
+            // Release our docking-API registration so the host can drop its
+            // strong retain on the view before dylib teardown. Harmless if
+            // we never registered (floating-fallback path).
+            if (g_panelHandle > 0) {
+                nppData._sendMessage(nppData._nppHandle,
+                                     NPPM_DMM_UNREGISTERPANEL,
+                                     (uintptr_t)g_panelHandle, 0);
+                g_panelHandle = 0;
+            }
+            break;
         default: break;
     }
 }
