@@ -552,7 +552,6 @@ static void setSelection(intptr_t startPos, intptr_t endPos) {
 @interface NavigatorPanel : NSView <NSOutlineViewDataSource, NSOutlineViewDelegate,
                                      NSTextFieldDelegate, NSMenuItemValidation>
 @property(nonatomic, strong) NSTextField *filterField;
-@property(nonatomic, strong) NSButton    *clearButton;
 @property(nonatomic, strong) XNOutlineView *outlineView;
 @property(nonatomic, strong) NSScrollView *scrollView;
 @property(nonatomic, strong) XNNode *rootNode;
@@ -612,13 +611,6 @@ static const CGFloat kRowPadding      = 3.0;  // rowHeight = ceil(font size) + p
     _filterField.bezelStyle = NSTextFieldRoundedBezel;
     [root addSubview:_filterField];
 
-    _clearButton = [NSButton buttonWithTitle:@"✕" target:self action:@selector(clearFilter:)];
-    _clearButton.translatesAutoresizingMaskIntoConstraints = NO;
-    _clearButton.bezelStyle = NSBezelStyleRounded;
-    _clearButton.bordered = YES;
-    _clearButton.font = [NSFont systemFontOfSize:10];
-    [root addSubview:_clearButton];
-
     // Outline view in a scroll view — use our XNOutlineView subclass so
     // the native triangle disappears and our +/- button takes its place.
     _fontSize = kDefaultFontSize;
@@ -670,17 +662,14 @@ static const CGFloat kRowPadding      = 3.0;  // rowHeight = ceil(font size) + p
     _outlineView.menu = menu;
 
     // Layout: filter row at top → outline view fills the rest.
+    // The filter field spans the full width; Esc on the field still clears
+    // it (handled in controlTextDidChange:) so the old trailing ✕ button
+    // was redundant and has been removed.
     [NSLayoutConstraint activateConstraints:@[
-        // Filter row sits at the top of the panel body
-        [_filterField.topAnchor     constraintEqualToAnchor:root.topAnchor constant:4],
-        [_filterField.leadingAnchor constraintEqualToAnchor:root.leadingAnchor constant:6],
-        [_filterField.trailingAnchor constraintEqualToAnchor:_clearButton.leadingAnchor constant:-4],
-        [_filterField.heightAnchor  constraintEqualToConstant:22],
-
-        [_clearButton.topAnchor     constraintEqualToAnchor:_filterField.topAnchor],
-        [_clearButton.trailingAnchor constraintEqualToAnchor:root.trailingAnchor constant:-6],
-        [_clearButton.widthAnchor   constraintEqualToConstant:26],
-        [_clearButton.heightAnchor  constraintEqualToConstant:22],
+        [_filterField.topAnchor      constraintEqualToAnchor:root.topAnchor constant:4],
+        [_filterField.leadingAnchor  constraintEqualToAnchor:root.leadingAnchor constant:6],
+        [_filterField.trailingAnchor constraintEqualToAnchor:root.trailingAnchor constant:-6],
+        [_filterField.heightAnchor   constraintEqualToConstant:22],
 
         // Outline fills the remaining space (flush to edges — no border)
         [_scrollView.topAnchor      constraintEqualToAnchor:_filterField.bottomAnchor constant:4],
@@ -940,10 +929,17 @@ static const CGFloat kRowPadding      = 3.0;  // rowHeight = ceil(font size) + p
     [self applyFilterFromField];
 }
 
-// ── Filter controls ───────────────────────────────────────────────────
-- (void)clearFilter:(id)sender {
-    self.filterField.stringValue = @"";
-    [self applyFilterFromField];
+// Esc clears the field (same behavior the ✕ button used to provide).
+- (BOOL)control:(NSControl *)control
+       textView:(NSTextView *)fieldEditor
+    doCommandBySelector:(SEL)cmd {
+    if (cmd == @selector(cancelOperation:) && control == self.filterField
+            && self.filterField.stringValue.length) {
+        self.filterField.stringValue = @"";
+        [self applyFilterFromField];
+        return YES;
+    }
+    return NO;
 }
 
 // Split out from controlTextDidChange: so we can invoke filter logic
@@ -1144,6 +1140,17 @@ extern "C" NPP_EXPORT FuncItem *getFuncsArray(int *nbF) {
 extern "C" NPP_EXPORT void beNotified(SCNotification *n) {
     if (!n) return;
     switch (n->nmhdr.code) {
+        case NPPN_TBMODIFICATION:
+            // Register our toolbar icon. The host looks for toolbar.png at
+            // the plugin's install-dir root (same folder as the dylib),
+            // which is where `Build + package` places it. Binds the icon
+            // to the Show-navigator menu command so clicking the toolbar
+            // button toggles the panel.
+            nppData._sendMessage(nppData._nppHandle,
+                                 NPPM_ADDTOOLBARICON_FORDARKMODE,
+                                 (uintptr_t)funcItem[IdxShowNavigator]._cmdID,
+                                 (intptr_t)"toolbar.png");
+            break;
         case NPPN_BUFFERACTIVATED:
         case NPPN_FILESAVED:
             // Auto-refresh when the active buffer changes or is saved.
