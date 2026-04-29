@@ -27,3 +27,10 @@ set_target_properties(XmlNavigator PROPERTIES PREFIX "" SUFFIX ".dylib")
 
 set(PLUGIN_INSTALL_DIR "$ENV{HOME}/.notepad++/plugins/XmlNavigator")
 install(TARGETS XmlNavigator DESTINATION "${PLUGIN_INSTALL_DIR}")
+# Toolbar icons land at the plugin root (not inside resources/) because
+# the source code passes "toolbar.png" verbatim to NPPM_ADDTOOLBARICON_-
+# FORDARKMODE, and that path is resolved relative to the plugin's install
+# directory. Both light and dark variants are installed; the host picks
+# the matching one based on macOS appearance.
+install(FILES resources/toolbar.png resources/toolbar_dark.png
+        DESTINATION "${PLUGIN_INSTALL_DIR}")
