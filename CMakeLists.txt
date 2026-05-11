@@ -25,7 +25,7 @@ target_compile_options(XmlNavigator PRIVATE -fobjc-arc)
 target_link_libraries(XmlNavigator PRIVATE "-framework Cocoa")
 set_target_properties(XmlNavigator PROPERTIES PREFIX "" SUFFIX ".dylib")
 
-set(PLUGIN_INSTALL_DIR "$ENV{HOME}/.notepad++/plugins/XmlNavigator")
+set(PLUGIN_INSTALL_DIR "$ENV{HOME}/.nextpad++/plugins/XmlNavigator")
 install(TARGETS XmlNavigator DESTINATION "${PLUGIN_INSTALL_DIR}")
 # Toolbar icons land at the plugin root (not inside resources/) because
 # the source code passes "toolbar.png" verbatim to NPPM_ADDTOOLBARICON_-
